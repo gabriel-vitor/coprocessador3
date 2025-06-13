@@ -1,164 +1,167 @@
-#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "header.h"
+#include <string.h>
+#include <math.h>
 
-// Define a dimensão total da matriz quadrada (5x5)
-#define MATRIX_SIZE 25
+#define WIDTH 3201
+#define HEIGHT 240
 
-/**
- * Imprime uma matriz formatada com delimitação de linhas e colunas.
- * @param label   Etiqueta que será exibida antes da matriz.
- * @param matrix  Ponteiro para o buffer linear contendo os elementos.
- * @param size    Ordem da matriz (ex.: 3 para 3x3, 0..3 permitido).
- */
-void print_matrix(const char* label, const int8_t* matrix, int size) {
-    // n = ordem da matriz + 2
-    uint8_t n = (uint8_t)size + 2;
-    uint8_t total = n * n;
-    printf("%s (ordem=%u):\n", label, n);
+unsigned char image[HEIGHT][WIDTH][3];
+unsigned char gray[HEIGHT][WIDTH];
+unsigned char output[HEIGHT][WIDTH];
 
-    // Itera por todos os slots do buffer linear
-    for (uint8_t idx = 0; idx < total; ++idx) {
-        // A cada início de nova linha, imprime o delimitador esquerdo
-        if (idx % n == 0) {
-            printf("| ");
-        }
-        // Exibe valor com largura fixa para alinhamento
-        printf("%4d", matrix[idx]);
-        // Se não for fim de linha, separa com vírgula
-        if ((idx + 1) % n != 0) {
-            printf(",");
-        } else {
-            // Delimitador direito ao fim da linha
-            printf(" |\n");
-        }
+// Lê imagem .ppm P6 (RGB binário)
+int load_ppm_image(const char *filename) {
+    FILE *fin = fopen(filename, "rb");
+    if (!fin) {
+        perror("Erro ao abrir imagem PPM");
+        return 0;
     }
-    printf("\n");
+
+    char header[3];
+    int width, height, maxval;
+
+    fscanf(fin, "%2s", header);
+    if (strcmp(header, "P6") != 0) {
+        fprintf(stderr, "Formato PPM inválido (esperado P6)\n");
+        fclose(fin);
+        return 0;
+    }
+
+    // Pular comentários
+    int c;
+    do {
+        c = fgetc(fin);
+        if (c == '#') while (fgetc(fin) != '\n');
+        else {
+            ungetc(c, fin);
+            break;
+        }
+    } while (1);
+
+    fscanf(fin, "%d %d %d", &width, &height, &maxval);
+    fgetc(fin); // pula '\n'
+    if (width != WIDTH || height != HEIGHT || maxval != 255) {
+        fprintf(stderr, "Dimensões ou intensidade inválidas\n");
+        fclose(fin);
+        return 0;
+    }
+
+    size_t read = fread(image, 1, WIDTH * HEIGHT * 3, fin);
+    fclose(fin);
+    return read == WIDTH * HEIGHT * 3;
 }
 
-/**
- * Valida se o código de operação e tamanho da matriz estão dentro dos limites suportados.
- * @param op_code     Código da operação (0..7 válido).
- * @param matrix_size Ordem da matriz (0..3 válido).
- * @return HW_SUCCESS se tudo for válido, HW_SEND_FAIL caso contrário.
- */
-int validate_operation(uint32_t op_code, uint32_t matrix_size) {
-    if (op_code > 7) {
-        fprintf(stderr, "Erro: código de operação inválido (%u). Deve estar entre 0 e 7.\n", op_code);
-        return HW_SEND_FAIL;
+// Converte para tons de cinza (8 bits)
+void convert_to_grayscale() {
+    for (int y = 0; y < HEIGHT; y++) {
+        for (int x = 0; x < WIDTH; x++) {
+            unsigned char r = image[y][x][0];
+            unsigned char g = image[y][x][1];
+            unsigned char b = image[y][x][2];
+            gray[y][x] = (unsigned char)(0.299 * r + 0.587 * g + 0.114 * b);
+        }
     }
-    if (matrix_size > 3) {
-        fprintf(stderr, "Erro: tamanho de matriz inválido (%u). Deve estar entre 0 e 3.\n", matrix_size);
-        return HW_SEND_FAIL;
-    }
-    return HW_SUCCESS;
 }
 
-int main(void) {
-    // Inicializa comunicação com a FPGA
-    printf(">> Iniciando módulo de hardware FPGA...\n");
-    if (begin_hw() != HW_SUCCESS) {
-        fprintf(stderr, "Erro: falha ao inicializar hardware.\n");
-        return EXIT_FAILURE;
+// Aplica filtro genérico de dimensão ksize
+void apply_filter(const int *kernel, int ksize) {
+    int k = ksize / 2;
+    memset(output, 0, sizeof(output));
+    for (int y = k; y < HEIGHT - k; y++) {
+        for (int x = k; x < WIDTH - k; x++) {
+            int sum = 0;
+            for (int i = -k; i <= k; i++) {
+                for (int j = -k; j <= k; j++) {
+                    sum += gray[y + i][x + j] * kernel[(i + k) * ksize + (j + k)];
+                }
+            }
+            output[y][x] = (unsigned char)fmin(fmax(sum, 0), 255);
+        }
     }
+}
 
-    // Loop principal
-    while (1) {
-        // Matrizes e buffers
-        int8_t matrix_a[MATRIX_SIZE] = {
-            10, 15, 20, 25, 5,
-            6, 7, 8, 9, 10,
-            10, 12, 10, 20, 15,
-            4, 5, 6, 7, 8,
-            9, 1, 2, 3, 4
-        };
-
-        int8_t matrix_b[MATRIX_SIZE] = {
-            1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1,
-            1, 1, 1, 1, 1
-        };
-
-        int8_t matrix_result[MATRIX_SIZE] = {0};
-        uint8_t overflow_flag = 0;
-
-        uint32_t op_code = 0;
-        uint32_t matrix_size = 0;
-        uint32_t scalar = 2;
-
-        // Menu de entrada
-        printf("=== Menu de Operações Aritméticas entre Matrizes ===\n");
-        printf("0 -> Adição\n");
-        printf("1 -> Subtração\n");
-        printf("2 -> Multiplicação matricial\n");
-        printf("3 -> Multiplicação por escalar\n");
-        printf("4 -> Não escolha! (É determinante)\n");
-        printf("5 -> Matriz transposta\n");
-        printf("6 -> Matriz oposta\n");
-
-        printf("Informe o código da operação [0 a 6], ou [9] para sair: ");
-        if (scanf("%u", &op_code) != 1 || op_code == 9) {
-            printf("Saindo do programa...\n");
-            break;
+// Aplica filtro do tipo gradiente (Sobel, Prewitt, Roberts)
+void gradient_filter(const int *kx, const int *ky, int ksize) {
+    int k = ksize / 2;
+    memset(output, 0, sizeof(output));
+    for (int y = k; y < HEIGHT - k; y++) {
+        for (int x = k; x < WIDTH - k; x++) {
+            int gx = 0, gy = 0;
+            for (int i = -k; i <= k; i++) {
+                for (int j = -k; j <= k; j++) {
+                    gx += gray[y + i][x + j] * kx[(i + k) * ksize + (j + k)];
+                    gy += gray[y + i][x + j] * ky[(i + k) * ksize + (j + k)];
+                }
+            }
+            int mag = (int)sqrt((double)(gx * gx + gy * gy));
+            output[y][x] = (unsigned char)(mag > 255 ? 255 : mag);
         }
-
-        printf("0 -> Matriz 2x2\n");
-        printf("1 -> Matriz 3x3\n");
-        printf("2 -> Matriz 4x4\n");
-        printf("3 -> Matriz 5x5\n");
-        printf("Informe a ordem da matriz: ");
-        if (scanf("%u", &matrix_size) != 1) {
-            fprintf(stderr, "Entrada inválida.\n");
-            continue;
-        }
-
-        if (validate_operation(op_code, matrix_size) != HW_SUCCESS) {
-            printf("Por favor, tente novamente.\n\n");
-            continue;
-        }
-
-        struct Params params = {
-            .a = matrix_a,
-            .b = matrix_b,
-            .opcode = op_code,
-            .size = matrix_size,
-            .scalar = scalar
-        };
-
-        printf(">> Enviando matrizes e configuração (opcode=%u, tamanho=%u)...\n", op_code, matrix_size);
-        if (send_data(&params) != HW_SUCCESS) {
-            fprintf(stderr, "Erro: falha ao enviar dados à FPGA.\n");
-            break;
-        }
-
-        // Zera buffers antes da leitura
-        for (int i = 0; i < MATRIX_SIZE; ++i) {
-            matrix_result[i] = 0;
-        }
-        overflow_flag = 0;
-
-        printf(">> Aguardando conclusão da operação na FPGA...\n");
-        if (read_results(matrix_result, &overflow_flag) != HW_SUCCESS) {
-            fprintf(stderr, "Erro: falha ao ler resultados da FPGA.\n");
-            break;
-        }
-
-        // Exibe os resultados
-        print_matrix("Matriz A", matrix_a, matrix_size);
-        print_matrix("Matriz B", matrix_b, matrix_size);
-        print_matrix("Resultado da FPGA", matrix_result, matrix_size);
-        printf("Overflow detectado: %s\n\n", (overflow_flag & 0x1) ? "SIM" : "NÃO");
-
-        // Espera para repetir
-        printf("Pressione ENTER para continuar...\n");
-        getchar(); // consome \n anterior
-        getchar(); // espera novo ENTER
     }
+}
 
-    // Finaliza comunicação com hardware
-    end_hw();
-    return EXIT_SUCCESS;
+// Kernels
+int sobel3x3_x[9] = {-1, 0, 1, -2, 0, 2, -1, 0, 1};
+int sobel3x3_y[9] = {-1, -2, -1, 0, 0, 0, 1, 2, 1};
+int prewitt3x3_x[9] = {-1, 0, 1, -1, 0, 1, -1, 0, 1};
+int prewitt3x3_y[9] = {-1, -1, -1, 0, 0, 0, 1, 1, 1};
+int roberts_x[4]  = {1, 0, 0, -1};
+int roberts_y[4]  = {0, 1, -1, 0};
+int laplacian5x5[25] = {0, 0, -1, 0, 0,
+                       0, -1, -2, -1, 0,
+                       -1, -2, 16, -2, -1,
+                       0, -1, -2, -1, 0,
+                       0, 0, -1, 0, 0};
+int sobel5x5_x[25] = {-2, -1, 0, 1, 2,
+                      -2, -1, 0, 1, 2,
+                      -4, -2, 0, 2, 4,
+                      -2, -1, 0, 1, 2,
+                      -2, -1, 0, 1, 2};
+int sobel5x5_y[25] = {-2, -2, -4, -2, -2,
+                      -1, -1, -2, -1, -1,
+                      0, 0, 0, 0, 0,
+                      1, 1, 2, 1, 1,
+                      2, 2, 4, 2, 2};
+
+// Salva imagem PGM
+void save_output(const char *filename) {
+    FILE *f = fopen(filename, "wb");
+    fprintf(f, "P5\n%d %d\n255\n", WIDTH, HEIGHT);
+    fwrite(output, 1, WIDTH * HEIGHT, f);
+    fclose(f);
+    printf("Imagem salva como: %s\n", filename);
+}
+
+// Menu interativo
+void menu() {
+    int opcao;
+    do {
+        printf("\n=== Filtros de Borda ===\n");
+        printf("1. Sobel 3x3\n");
+        printf("2. Sobel 5x5\n");
+        printf("3. Prewitt 3x3\n");
+        printf("4. Roberts 2x2\n");
+        printf("5. Laplaciano 5x5\n");
+        printf("0. Sair\n");
+        printf("Escolha a opção: ");
+        scanf("%d", &opcao);
+
+        switch (opcao) {
+            case 1: gradient_filter(sobel3x3_x, sobel3x3_y, 3); save_output("saida_sobel3x3.pgm"); break;
+            case 2: gradient_filter(sobel5x5_x, sobel5x5_y, 5); save_output("saida_sobel5x5.pgm"); break;
+            case 3: gradient_filter(prewitt3x3_x, prewitt3x3_y, 3); save_output("saida_prewitt.pgm"); break;
+            case 4: gradient_filter(roberts_x, roberts_y, 2); save_output("saida_roberts.pgm"); break;
+            case 5: apply_filter(laplacian5x5, 5); save_output("saida_laplaciano.pgm"); break;
+            case 0: printf("Saindo...\n"); break;
+            default: printf("Opção inválida.\n");
+        }
+    } while (opcao != 0);
+}
+
+int main() {
+    if (!load_ppm_image("imagem.ppm")) return 1;
+    convert_to_grayscale();
+    printf("Imagem convertida para tons de cinza.\n");
+    menu();
+    return 0;
 }
